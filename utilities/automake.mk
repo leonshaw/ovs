@@ -137,7 +137,6 @@ utilities_ovs_vsctl_LDADD = lib/libopenvswitch.la
 
 utilities_ovs_ofproxy_SOURCES = utilities/ovs-ofproxy.c
 utilities_ovs_ofproxy_LDADD = \
-	ofproto/libofproto.la \
 	lib/libopenvswitch.la
 
 if LINUX

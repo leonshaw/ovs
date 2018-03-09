@@ -7,6 +7,7 @@
 
 #include "openvswitch/hmap.h"
 #include "openvswitch/list.h"
+#include "openvswitch/ofp-bundle.h"
 #include "openvswitch/ofp-msgs.h"
 #include "openvswitch/ofp-util.h"
 #include "openvswitch/ofpbuf.h"
@@ -128,6 +129,27 @@ static uint32_t version_mask = 0;
 static long long barrier_interval = 5;
 static bool snoop = false;
 
+static struct xid_entry *
+xid_alloc(struct switch_context *sw, struct ctlr_context *ctlr,
+          uint32_t orig_xid)
+{
+    /* TODO: allocate consistant xid for MULTIPART_REQUEST */
+    struct xid_entry *entry = xzalloc(sizeof(struct xid_entry));
+    entry->xid = sw->next_xid++;
+    entry->orig_xid = orig_xid;
+    entry->sw = sw;
+    entry->ctlr = ctlr;
+    xid_insert(entry);
+    return entry;
+}
+
+static void
+xid_free(struct xid_entry *entry)
+{
+    xid_remove(entry);
+    free(entry);
+}
+
 static void
 xid_insert(struct xid_entry *entry)
 {
@@ -171,8 +193,7 @@ xid_barrier(struct xid_entry *entry)
         if (curr == entry) {
             break;
         } else {
-            xid_remove(curr);
-            free(curr);
+            xid_free(curr);
         }
     }
 }
@@ -386,8 +407,7 @@ ctlr_xid_clear(struct ctlr_context *ctlr)
 {
     struct xid_entry *entry, *next;
     LIST_FOR_EACH_SAFE (entry, next, ctlr_node, &ctlr->xid_list) {
-        xid_remove(entry);
-        free(entry);
+        xid_free(entry);
     }
 }
 
@@ -431,9 +451,21 @@ ctlr_wait(struct ctlr_context *ctlr)
 
 /* Clone ofp message and alter xid */
 static struct ofpbuf *
-ofp_msg_dup_xid(struct ofpbuf *msg, uint32_t xid)
+ofp_msg_dup_xid(enum ofptype type, const struct ofpbuf *msg, uint32_t xid)
 {
-    struct ofpbuf *new_msg = ofpbuf_clone(msg);
+    struct ofpbuf *new_msg;
+    if (type == OFPTYPE_BUNDLE_ADD_MESSAGE) {
+        /* This skips call to ofputil_encode_bundle_add by directly modifying
+         * the inner message, which is pointed to by bundle_add.msg */
+        new_msg = ofpbuf_clone(msg);
+        struct ofputil_bundle_add_msg bundle_add;
+        if (!ofputil_decode_bundle_add(new_msg->data, &bundle_add, NULL)) {
+            CONST_CAST(struct ofp_header *, bundle_add.msg)->xid = htonl(xid);
+        }
+    } else {
+        new_msg = ofpbuf_clone(msg);
+    }
+
     ((struct ofp_header *)new_msg->data)->xid = htonl(xid);
     return new_msg;
 }
@@ -449,14 +481,9 @@ process_ctlr_message(struct ctlr_context *ctlr, struct ofpbuf *msg)
             rconn_send(ctlr->rconn, ofputil_encode_echo_reply(header), NULL);
         } else {
             struct xid_entry *entry =
-                xzalloc(sizeof(struct xid_entry));
-            entry->xid = ctlr->sw->next_xid++;
-            entry->orig_xid = ntohl(header->xid);
-            entry->sw = ctlr->sw;
-            entry->ctlr = ctlr;
-            xid_insert(entry);
+                xid_alloc(ctlr->sw, ctlr, ntohl(header->xid));
             rconn_send(ctlr->sw->rconn,
-                       ofp_msg_dup_xid(msg, entry->xid),
+                       ofp_msg_dup_xid(type, msg, entry->xid),
                        NULL);
         }
     }
@@ -480,10 +507,11 @@ process_sw_message(struct switch_context *sw, struct ofpbuf *msg)
                 }
                 if (entry->ctlr) {
                     rconn_send(entry->ctlr->rconn,
-                               ofp_msg_dup_xid(msg, entry->orig_xid),
+                               ofp_msg_dup_xid(type, msg, entry->orig_xid),
                                NULL);
-                } else {
-                    xid_remove(entry);
+                }
+                if (type == OFPTYPE_BARRIER_REPLY) {
+                    xid_free(entry);
                 }
             }
         }
@@ -493,10 +521,7 @@ process_sw_message(struct switch_context *sw, struct ofpbuf *msg)
 static void
 switch_send_barrier(struct switch_context *sw)
 {
-    struct xid_entry *entry = xzalloc(sizeof(struct xid_entry));
-    entry->xid = sw->next_xid++;
-    entry->sw = sw;
-    xid_insert(entry);
+    struct xid_entry *entry = xid_alloc(sw, NULL, 0);
     struct ofpbuf *msg = ofputil_encode_barrier_request(sw->protocol_version);
     ((struct ofp_header *)msg->data)->xid = htonl(entry->xid);
     rconn_send(sw->rconn, msg, NULL);
